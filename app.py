@@ -23,13 +23,15 @@ def download_audio(data: dict = Body(...)):
 
         # yt-dlp options
         ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": out_file,
-            "postprocessors": [{
+                "format": "bestaudio/best",
+                "outtmpl": out_file,
+                "cookiefile": "/data/cookies.txt",  # 👈 use Render disk path
+                "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "m4a",
-            }]
-        }
+    }]
+}
+
 
         # Download audio
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
