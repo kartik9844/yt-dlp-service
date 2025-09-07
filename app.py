@@ -25,7 +25,7 @@ def download_audio(data: dict = Body(...)):
         ydl_opts = {
                 "format": "bestaudio/best",
                 "outtmpl": out_file,
-                "cookiefile": "/data/cookies.txt",  # 👈 use Render disk path
+                "cookiefile": "cookies.txt",  # 👈 use Render disk path
                 "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "m4a",
