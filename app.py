@@ -1,68 +1,11 @@
-# from fastapi import FastAPI, Body
-# from fastapi.responses import FileResponse, JSONResponse
-# import yt_dlp
-# import os
-# import uuid
-# import glob
-
-# app = FastAPI(title="YouTube Audio Downloader Microservice")
-
-# @app.post("/download")
-# def download_audio(data: dict = Body(...)):
-#     """
-#     Accepts: {"url": "https://youtube.com/..."}
-#     Returns: m4a audio file for transcription
-#     """
-#     try:
-#         url = data.get("url")
-#         if not url:
-#             return JSONResponse({"error": "Missing 'url'"}, status_code=400)
-
-#         # Unique filename base (without extension)
-#         file_id = str(uuid.uuid4())
-#         out_file = f"/tmp/{file_id}.m4a"
-
-#         # yt-dlp options
-#         ydl_opts = {
-#             "format": "bestaudio/best",
-#             "outtmpl": out_file,
-#             "cookiefile": "cookies.txt",  # 👈 use Render disk or local path
-#             "postprocessors": [{
-#                 "key": "FFmpegExtractAudio",
-#                 "preferredcodec": "m4a",
-#             }]
-#         }
-
-#         # Download audio
-#         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-#             ydl.download([url])
-
-#         # Handle yt-dlp double extension issue (.m4a.m4a)
-#         final_file = out_file
-#         if not os.path.exists(final_file):
-#             alt_file = final_file + ".m4a"
-#             if os.path.exists(alt_file):
-#                 final_file = alt_file
-#             else:
-#                 # fallback: glob search
-#                 files = glob.glob(f"/tmp/{file_id}*.m4a*")
-#                 if files:
-#                     final_file = files[0]
-#                 else:
-#                     return JSONResponse({"error": "File not found after download"}, status_code=500)
-
-#         # Return file
-#         return FileResponse(final_file, media_type="audio/m4a", filename="audio.m4a")
-
-#     except Exception as e:
-#         return JSONResponse({"error": str(e)}, status_code=500)
-from fastapi import FastAPI, Body, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Body, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 import yt_dlp
 import os
 import uuid
 import glob
 import logging
+import requests
 
 # basic logging
 logging.basicConfig(level=logging.INFO)
@@ -70,15 +13,75 @@ logger = logging.getLogger("yt-audio-service")
 
 app = FastAPI(title="YouTube Audio Downloader Microservice")
 
+WEBHOOK_URL = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
+
+def process_and_send_audio(url: str, file_id: str):
+    """
+    Background task to download audio and send it to the n8n webhook.
+    """
+    logger.info(f"Background processing started for {file_id}. URL: {url}")
+    
+    # Use yt-dlp templating
+    out_template = f"/tmp/{file_id}.%(ext)s"
+    
+    # yt-dlp options
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": out_template,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+        }],
+        "logger": logger,
+        "quiet": False,
+    }
+
+    final_file = None
+    try:
+        logger.info(f"Starting yt-dlp download for {file_id}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Try to find the downloaded file
+        pattern = f"/tmp/{file_id}*.m4a*"
+        files = glob.glob(pattern)
+        logger.info(f"Globbed files for {file_id}: {files}")
+        
+        if not files:
+            logger.error(f"No files found after yt-dlp download for {file_id}")
+            # Optionally report error to webhook
+            return
+
+        final_file = files[0]
+        logger.info(f"File downloaded successfully: {final_file}")
+
+        # Send to n8n webhook
+        logger.info(f"Uploading file {final_file} to webhook: {WEBHOOK_URL}")
+        with open(final_file, 'rb') as f:
+            files_payload = {'file': (os.path.basename(final_file), f, 'audio/m4a')}
+            response = requests.post(WEBHOOK_URL, files=files_payload)
+        
+        logger.info(f"Webhook response: {response.status_code} - {response.text}")
+
+    except Exception as e:
+        logger.exception(f"Error processing {file_id}: {e}")
+        # Could also notify webhook of failure here
+    finally:
+        # Cleanup
+        if final_file and os.path.exists(final_file):
+            logger.info(f"Cleaning up file: {final_file}")
+            os.remove(final_file)
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/download")
-def download_audio(data: dict = Body(...)):
+def download_audio(background_tasks: BackgroundTasks, data: dict = Body(...)):
     """
     Accepts JSON: {"url": "https://youtube.com/..."}
-    Returns: m4a audio file (FileResponse) or JSON error
+    Returns: JSON {"message": "received link processing"} immediately.
+    Processing happens in background and result is sent to n8n webhook.
     """
     try:
         logger.info("Received download request")
@@ -87,45 +90,16 @@ def download_audio(data: dict = Body(...)):
             logger.warning("Missing 'url' in request body")
             raise HTTPException(status_code=400, detail="Missing 'url'")
 
-        # Unique filename base (without extension)
+        # Generate ID
         file_id = str(uuid.uuid4())
-        # Use yt-dlp templating to avoid double suffix issues
-        out_template = f"/tmp/{file_id}.%(ext)s"
-
-        # yt-dlp options
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": out_template,
-            # remove cookiefile unless you really need it
-            # "cookiefile": "cookies.txt",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "m4a",
-            }],
-            "logger": logger,
-            "quiet": False,
-        }
-
-        logger.info("Starting yt-dlp download for url: %s", url)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        # Try to find the downloaded file
-        pattern = f"/tmp/{file_id}*.m4a*"
-        files = glob.glob(pattern)
-        logger.info("Globbed files: %s", files)
-        if not files:
-            logger.error("No files found after yt-dlp download. pattern=%s", pattern)
-            raise HTTPException(status_code=500, detail="File not found after download")
-
-        # pick first match
-        final_file = files[0]
-        logger.info("Returning file: %s", final_file)
-
-        return FileResponse(final_file, media_type="audio/m4a", filename="audio.m4a")
+        
+        # Enqueue background task
+        background_tasks.add_task(process_and_send_audio, url, file_id)
+        
+        return JSONResponse({"message": "received link processing", "id": file_id})
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Unhandled exception during download")
+        logger.exception("Unhandled exception during request handling")
         raise HTTPException(status_code=500, detail=str(e))
