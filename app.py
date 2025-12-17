@@ -28,6 +28,7 @@ def process_and_send_audio(url: str, file_id: str):
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": out_template,
+        "cookiefile": "cookies.txt",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "m4a",
