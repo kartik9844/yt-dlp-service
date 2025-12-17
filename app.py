@@ -10,18 +10,22 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yt-audio-service")
 
-app = FastAPI(title="YouTube Audio Downloader (Async + Webhook)")
+app = FastAPI(title="YouTube Audio Downloader (Async + Fast Mode)")
 
-# ---- CONFIG ---- #
+# ---------------- CONFIG ---------------- #
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 
-N8N_WEBHOOK_URL = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
-TMP_DIR = "/tmp" if os.name != "nt" else os.path.join(BASE_DIR, "tmp")
-
+TMP_DIR = os.path.join(BASE_DIR, "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# ---------------- #
+N8N_WEBHOOK_URL = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
+
+# SAFE speed value (2–4)
+CONCURRENT_FRAGMENTS = 4
+
+# -------------------------------------- #
 
 @app.get("/health")
 def health():
@@ -32,11 +36,6 @@ def download_audio(
     data: dict = Body(...),
     background_tasks: BackgroundTasks = None
 ):
-    """
-    Accepts JSON: {"url": "..."}
-    Responds immediately.
-    Processing happens in background.
-    """
     url = data.get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url'")
@@ -44,17 +43,18 @@ def download_audio(
     if not os.path.exists(COOKIES_PATH):
         raise HTTPException(status_code=500, detail="cookies.txt not found")
 
-    logger.info("Received link, queuing background job")
+    logger.info("Received link → starting background task")
     background_tasks.add_task(process_and_send_audio, url)
 
     return JSONResponse({
         "status": "received",
-        "message": "Link received. Processing started."
+        "message": "Link received. Processing started in background."
     })
 
-# ---------------- BACKGROUND TASK ---------------- #
+# ---------------- BACKGROUND JOB ---------------- #
 
 def process_and_send_audio(url: str):
+    audio_file = None
     try:
         file_id = str(uuid.uuid4())
         out_template = os.path.join(TMP_DIR, f"{file_id}.%(ext)s")
@@ -62,16 +62,17 @@ def process_and_send_audio(url: str):
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
-            "cookiefile": "cookies.txt",   # ✅ IMPORTANT
+            "cookiefile": "cookies.txt",
+            "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,  # 🚀 SPEED BOOST
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "m4a",
             }],
             "quiet": True,
-            "nocheckcertificate": True,
+            "no_warnings": True,
         }
 
-        logger.info("Starting yt-dlp download")
+        logger.info("yt-dlp download started (parallel fragments=%s)", CONCURRENT_FRAGMENTS)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -82,7 +83,7 @@ def process_and_send_audio(url: str):
         audio_file = files[0]
         logger.info("Audio ready: %s", audio_file)
 
-        # Send audio to n8n
+        # Send audio to n8n (streamed, not in-memory)
         with open(audio_file, "rb") as f:
             response = requests.post(
                 N8N_WEBHOOK_URL,
@@ -93,22 +94,16 @@ def process_and_send_audio(url: str):
                     "source": "yt-dlp",
                     "original_url": url
                 },
-                timeout=180
+                timeout=300
             )
 
         response.raise_for_status()
         logger.info("Audio successfully sent to n8n")
 
-        # Cleanup
-        try:
-            os.remove(audio_file)
-        except Exception:
-            pass
-
     except Exception as e:
         logger.exception("Background processing failed")
 
-        # Notify n8n about error (optional but recommended)
+        # Optional: notify n8n of error
         try:
             requests.post(
                 N8N_WEBHOOK_URL,
@@ -121,3 +116,12 @@ def process_and_send_audio(url: str):
             )
         except Exception:
             pass
+
+    finally:
+        # Always cleanup local file
+        if audio_file and os.path.exists(audio_file):
+            try:
+                os.remove(audio_file)
+                logger.info("Cleaned up local audio file")
+            except Exception:
+                pass
