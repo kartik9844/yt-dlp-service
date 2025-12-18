@@ -22,8 +22,7 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 N8N_WEBHOOK_URL = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
 
-# SAFE speed value (2–4)
-CONCURRENT_FRAGMENTS = 4
+CONCURRENT_FRAGMENTS = 4  # safe speed
 
 # -------------------------------------- #
 
@@ -36,24 +35,37 @@ def download_audio(
     data: dict = Body(...),
     background_tasks: BackgroundTasks = None
 ):
+    """
+    Expects JSON:
+    {
+      "url": "https://youtube.com/...",
+      "name": "desired_filename"
+    }
+    """
     url = data.get("url")
+    name = data.get("name")
+
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url'")
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'name'")
 
     if not os.path.exists(COOKIES_PATH):
         raise HTTPException(status_code=500, detail="cookies.txt not found")
 
-    logger.info("Received link → starting background task")
-    background_tasks.add_task(process_and_send_audio, url)
+    logger.info("Received link + name → starting background task")
+    background_tasks.add_task(process_and_send_audio, url, name)
 
     return JSONResponse({
         "status": "received",
-        "message": "Link received. Processing started in background."
+        "message": "Link received. Processing started in background.",
+        "name": name
     })
 
 # ---------------- BACKGROUND JOB ---------------- #
 
-def process_and_send_audio(url: str):
+def process_and_send_audio(url: str, name: str):
     audio_file = None
     try:
         file_id = str(uuid.uuid4())
@@ -62,8 +74,8 @@ def process_and_send_audio(url: str):
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
-            "cookiefile": "cookies.txt",
-            "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,  # 🚀 SPEED BOOST
+            "cookiefile": COOKIES_PATH,
+            "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "m4a",
@@ -72,7 +84,7 @@ def process_and_send_audio(url: str):
             "no_warnings": True,
         }
 
-        logger.info("yt-dlp download started (parallel fragments=%s)", CONCURRENT_FRAGMENTS)
+        logger.info("yt-dlp download started for: %s", url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -83,14 +95,15 @@ def process_and_send_audio(url: str):
         audio_file = files[0]
         logger.info("Audio ready: %s", audio_file)
 
-        # Send audio to n8n (streamed, not in-memory)
+        # 🔥 SEND AUDIO + NAME BACK TO N8N
         with open(audio_file, "rb") as f:
             response = requests.post(
                 N8N_WEBHOOK_URL,
                 files={
-                    "file": ("audio.m4a", f, "audio/m4a")
+                    "file": (f"{name}.m4a", f, "audio/m4a")
                 },
                 data={
+                    "name": name,
                     "source": "yt-dlp",
                     "original_url": url
                 },
@@ -98,19 +111,20 @@ def process_and_send_audio(url: str):
             )
 
         response.raise_for_status()
-        logger.info("Audio successfully sent to n8n")
+        logger.info("Audio + name successfully sent to n8n")
 
     except Exception as e:
         logger.exception("Background processing failed")
 
-        # Optional: notify n8n of error
+        # Notify n8n about error (optional)
         try:
             requests.post(
                 N8N_WEBHOOK_URL,
                 json={
                     "status": "error",
                     "error": str(e),
-                    "url": url
+                    "url": url,
+                    "name": name
                 },
                 timeout=30
             )
@@ -118,7 +132,7 @@ def process_and_send_audio(url: str):
             pass
 
     finally:
-        # Always cleanup local file
+        # Cleanup
         if audio_file and os.path.exists(audio_file):
             try:
                 os.remove(audio_file)
