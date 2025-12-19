@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yt-audio-service")
 
-app = FastAPI(title="YouTube Audio Downloader + Smart Splitter")
+app = FastAPI(title="YouTube Audio Downloader + Smart Splitter (Stable)")
 
 # ---------------- CONFIG ---------------- #
 
@@ -27,7 +27,6 @@ os.makedirs(TMP_DIR, exist_ok=True)
 N8N_WEBHOOK_PROD = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
 N8N_WEBHOOK_TEST = "https://n8n.srv949845.hstgr.cloud/webhook-test/f30594bf-7b95-4766-9d7a-a84a2a359306"
 
-CONCURRENT_FRAGMENTS = 4
 CHUNK_SECONDS = 1800      # 30 minutes
 ONE_HOUR_SECONDS = 3600
 
@@ -163,13 +162,12 @@ def process_and_send_audio(url, name, serial_no, webhook_url, mode):
     try:
         out_template = os.path.join(TMP_DIR, f"{uid}.%(ext)s")
 
-        # ✅ FINAL & STABLE yt-dlp CONFIG
+        # ✅ MOST STABLE yt-dlp CONFIG (VIDEO → AUDIO)
         ydl_opts = {
-            "format": "bv*+ba/best",   # 🔥 FIXED LINE (MOST IMPORTANT)
+            "format": "bestvideo+bestaudio/best",
             "outtmpl": out_template,
             "cookiefile": COOKIES_PATH,
-            "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-            "merge_output_format": "mkv",
+            "merge_output_format": "mp4",
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -181,14 +179,14 @@ def process_and_send_audio(url, name, serial_no, webhook_url, mode):
             "no_warnings": True,
         }
 
-        logger.info("Downloading audio | serial=%s | mode=%s", serial_no, mode)
+        logger.info("Downloading video | serial=%s | mode=%s", serial_no, mode)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = glob.glob(os.path.join(TMP_DIR, f"{uid}*.m4a"))
         if not files:
-            raise RuntimeError("Audio file not found")
+            raise RuntimeError("Audio file not found after extraction")
 
         audio_file = files[0]
 
