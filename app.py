@@ -149,8 +149,11 @@ def send_to_webhook(file_path: str, payload: dict, webhook_url: str):
             )
 
     except Exception as e:
-        logger.exception("🔥 Webhook exception | file=%s | error=%s",
-                         os.path.basename(file_path), str(e))
+        logger.exception(
+            "🔥 Webhook exception | file=%s | error=%s",
+            os.path.basename(file_path),
+            str(e)
+        )
 
 # ---------------- BACKGROUND JOB ---------------- #
 
@@ -160,12 +163,13 @@ def process_and_send_audio(url, name, serial_no, webhook_url, mode):
     try:
         out_template = os.path.join(TMP_DIR, f"{uid}.%(ext)s")
 
-        # ✅ FINAL yt-dlp CONFIG (DO NOT FORCE m4a)
+        # ✅ FINAL & STABLE yt-dlp CONFIG
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "bv*+ba/best",   # 🔥 FIXED LINE (MOST IMPORTANT)
             "outtmpl": out_template,
             "cookiefile": COOKIES_PATH,
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+            "merge_output_format": "mkv",
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
