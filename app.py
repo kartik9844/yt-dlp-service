@@ -55,10 +55,7 @@ def handle_download_request(
     if not os.path.exists(COOKIES_PATH):
         raise HTTPException(status_code=500, detail="cookies.txt missing")
 
-    logger.info(
-        "Request received | mode=%s | serial_no=%s | name=%s",
-        mode, serial_no, name
-    )
+    logger.info("Request received | mode=%s | serial=%s | name=%s", mode, serial_no, name)
 
     background_tasks.add_task(
         process_and_send_audio,
@@ -84,18 +81,14 @@ def download_production(
     data: dict = Body(...),
     background_tasks: BackgroundTasks = None
 ):
-    return handle_download_request(
-        data, background_tasks, N8N_WEBHOOK_PROD, mode="production"
-    )
+    return handle_download_request(data, background_tasks, N8N_WEBHOOK_PROD, "production")
 
 @app.post("/download-test")
 def download_test(
     data: dict = Body(...),
     background_tasks: BackgroundTasks = None
 ):
-    return handle_download_request(
-        data, background_tasks, N8N_WEBHOOK_TEST, mode="test"
-    )
+    return handle_download_request(data, background_tasks, N8N_WEBHOOK_TEST, "test")
 
 # ---------------- UTILITIES ---------------- #
 
@@ -109,7 +102,8 @@ def get_audio_duration(file_path: str) -> int:
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        check=True
     )
     return int(float(result.stdout.strip()))
 
@@ -118,9 +112,9 @@ def split_audio(file_path: str, base_name: str, total_parts: int):
 
     for i in range(total_parts):
         start = i * CHUNK_SECONDS
-        out_file = os.path.join(
-            TMP_DIR, f"{base_name}_part{i+1}.m4a"
-        )
+        out_file = os.path.join(TMP_DIR, f"{base_name}_part{i+1}.m4a")
+
+        logger.info("Splitting part %s/%s", i + 1, total_parts)
 
         subprocess.run(
             [
@@ -128,11 +122,11 @@ def split_audio(file_path: str, base_name: str, total_parts: int):
                 "-i", file_path,
                 "-ss", str(start),
                 "-t", str(CHUNK_SECONDS),
-                "-c", "copy",
+                "-acodec", "aac",
+                "-b:a", "128k",
                 out_file
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            check=True
         )
 
         chunk_files.append(out_file)
@@ -140,15 +134,40 @@ def split_audio(file_path: str, base_name: str, total_parts: int):
     return chunk_files
 
 def send_to_webhook(file_path: str, payload: dict, webhook_url: str):
-    with open(file_path, "rb") as f:
-        requests.post(
-            webhook_url,
-            files={
-                "file": (os.path.basename(file_path), f, "audio/m4a")
-            },
-            data=payload,
-            timeout=600
+    try:
+        with open(file_path, "rb") as f:
+            response = requests.post(
+                webhook_url,
+                files={
+                    "file": (os.path.basename(file_path), f, "audio/m4a")
+                },
+                data=payload,
+                timeout=600
+            )
+
+        if response.status_code != 200:
+            logger.error(
+                "❌ Webhook failed | file=%s | status=%s | response=%s",
+                os.path.basename(file_path),
+                response.status_code,
+                response.text
+            )
+        else:
+            logger.info(
+                "✅ Webhook success | serial=%s | part=%s/%s | file=%s",
+                payload.get("serial_no"),
+                payload.get("part_no"),
+                payload.get("total_parts"),
+                os.path.basename(file_path)
+            )
+
+    except Exception as e:
+        logger.exception(
+            "🔥 Webhook exception | file=%s | error=%s",
+            os.path.basename(file_path),
+            str(e)
         )
+
 
 # ---------------- BACKGROUND JOB ---------------- #
 
@@ -160,20 +179,16 @@ def process_and_send_audio(
     mode: str
 ):
     uid = str(uuid.uuid4())
-    audio_file = None
 
     try:
         out_template = os.path.join(TMP_DIR, f"{uid}.%(ext)s")
 
+        # 🔥 FIX 1: Download m4a directly (NO yt-dlp FFmpegExtractAudio)
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio",
             "outtmpl": out_template,
             "cookiefile": COOKIES_PATH,
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "m4a",
-            }],
             "quiet": True,
             "no_warnings": True,
         }
@@ -188,9 +203,12 @@ def process_and_send_audio(
             raise RuntimeError("Audio file not found")
 
         audio_file = files[0]
-        duration = get_audio_duration(audio_file)
 
-        # 🔥 SPLIT LOGIC (CORE REQUIREMENT)
+        logger.info("Download completed, probing duration...")
+        duration = get_audio_duration(audio_file)
+        logger.info("Duration: %s seconds", duration)
+
+        # 🔥 CORE SPLIT LOGIC
         if duration <= ONE_HOUR_SECONDS:
             chunk_files = [audio_file]
             total_parts = 1
@@ -198,12 +216,9 @@ def process_and_send_audio(
             total_parts = math.ceil(duration / CHUNK_SECONDS)
             chunk_files = split_audio(audio_file, uid, total_parts)
 
-        logger.info(
-            "Prepared %s part(s) | serial=%s | duration=%ss",
-            total_parts, serial_no, duration
-        )
+        logger.info("Prepared %s part(s)", total_parts)
 
-        # 🚀 SEND EACH PART AS SEPARATE WEBHOOK CALL
+        # 🚀 SEND EACH PART AS SEPARATE WEBHOOK
         with ThreadPoolExecutor(max_workers=total_parts) as executor:
             for idx, chunk in enumerate(chunk_files, start=1):
                 payload = {
@@ -217,18 +232,13 @@ def process_and_send_audio(
                     "original_url": url
                 }
 
-                executor.submit(
-                    send_to_webhook,
-                    chunk,
-                    payload,
-                    webhook_url
-                )
+                executor.submit(send_to_webhook, chunk, payload, webhook_url)
 
     except Exception:
         logger.exception("Processing failed | serial=%s", serial_no)
 
     finally:
-        # Cleanup temp files
+        # Cleanup
         for f in glob.glob(os.path.join(TMP_DIR, f"{uid}*")):
             try:
                 os.remove(f)
