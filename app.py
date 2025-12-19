@@ -6,11 +6,14 @@ import uuid
 import glob
 import logging
 import requests
+import subprocess
+import math
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yt-audio-service")
 
-app = FastAPI(title="YouTube Audio Downloader (Async + Fast Mode)")
+app = FastAPI(title="YouTube Audio Downloader + Smart Splitter")
 
 # ---------------- CONFIG ---------------- #
 
@@ -20,9 +23,13 @@ COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 TMP_DIR = os.path.join(BASE_DIR, "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 
-N8N_WEBHOOK_URL = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
+# Webhooks
+N8N_WEBHOOK_PROD = "https://n8n.srv949845.hstgr.cloud/webhook/f30594bf-7b95-4766-9d7a-a84a2a359306"
+N8N_WEBHOOK_TEST = "https://n8n.srv949845.hstgr.cloud/webhook-test/f30594bf-7b95-4766-9d7a-a84a2a359306"
 
-CONCURRENT_FRAGMENTS = 4  # safe speed
+CONCURRENT_FRAGMENTS = 4
+CHUNK_SECONDS = 1800      # 30 minutes
+ONE_HOUR_SECONDS = 3600
 
 # -------------------------------------- #
 
@@ -30,46 +37,133 @@ CONCURRENT_FRAGMENTS = 4  # safe speed
 def health():
     return {"status": "ok"}
 
-@app.post("/download")
-def download_audio(
-    data: dict = Body(...),
-    background_tasks: BackgroundTasks = None
+# -------- SHARED REQUEST HANDLER -------- #
+
+def handle_download_request(
+    data: dict,
+    background_tasks: BackgroundTasks,
+    webhook_url: str,
+    mode: str
 ):
-    """
-    Expects JSON:
-    {
-      "url": "https://youtube.com/...",
-      "name": "desired_filename"
-    }
-    """
     url = data.get("url")
     name = data.get("name")
+    serial_no = data.get("serial_no")
 
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing 'url'")
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Missing 'name'")
+    if not url or not name or not serial_no:
+        raise HTTPException(status_code=400, detail="url, name, serial_no required")
 
     if not os.path.exists(COOKIES_PATH):
-        raise HTTPException(status_code=500, detail="cookies.txt not found")
+        raise HTTPException(status_code=500, detail="cookies.txt missing")
 
-    logger.info("Received link + name → starting background task")
-    background_tasks.add_task(process_and_send_audio, url, name)
+    logger.info(
+        "Request received | mode=%s | serial_no=%s | name=%s",
+        mode, serial_no, name
+    )
+
+    background_tasks.add_task(
+        process_and_send_audio,
+        url,
+        name,
+        serial_no,
+        webhook_url,
+        mode
+    )
 
     return JSONResponse({
         "status": "received",
-        "message": "Link received. Processing started in background.",
-        "name": name
+        "mode": mode,
+        "message": "Processing started",
+        "name": name,
+        "serial_no": serial_no
     })
+
+# -------- ENDPOINTS -------- #
+
+@app.post("/download")
+def download_production(
+    data: dict = Body(...),
+    background_tasks: BackgroundTasks = None
+):
+    return handle_download_request(
+        data, background_tasks, N8N_WEBHOOK_PROD, mode="production"
+    )
+
+@app.post("/download-test")
+def download_test(
+    data: dict = Body(...),
+    background_tasks: BackgroundTasks = None
+):
+    return handle_download_request(
+        data, background_tasks, N8N_WEBHOOK_TEST, mode="test"
+    )
+
+# ---------------- UTILITIES ---------------- #
+
+def get_audio_duration(file_path: str) -> int:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    return int(float(result.stdout.strip()))
+
+def split_audio(file_path: str, base_name: str, total_parts: int):
+    chunk_files = []
+
+    for i in range(total_parts):
+        start = i * CHUNK_SECONDS
+        out_file = os.path.join(
+            TMP_DIR, f"{base_name}_part{i+1}.m4a"
+        )
+
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", file_path,
+                "-ss", str(start),
+                "-t", str(CHUNK_SECONDS),
+                "-c", "copy",
+                out_file
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        chunk_files.append(out_file)
+
+    return chunk_files
+
+def send_to_webhook(file_path: str, payload: dict, webhook_url: str):
+    with open(file_path, "rb") as f:
+        requests.post(
+            webhook_url,
+            files={
+                "file": (os.path.basename(file_path), f, "audio/m4a")
+            },
+            data=payload,
+            timeout=600
+        )
 
 # ---------------- BACKGROUND JOB ---------------- #
 
-def process_and_send_audio(url: str, name: str):
+def process_and_send_audio(
+    url: str,
+    name: str,
+    serial_no: str,
+    webhook_url: str,
+    mode: str
+):
+    uid = str(uuid.uuid4())
     audio_file = None
+
     try:
-        file_id = str(uuid.uuid4())
-        out_template = os.path.join(TMP_DIR, f"{file_id}.%(ext)s")
+        out_template = os.path.join(TMP_DIR, f"{uid}.%(ext)s")
 
         ydl_opts = {
             "format": "bestaudio/best",
@@ -84,58 +178,59 @@ def process_and_send_audio(url: str, name: str):
             "no_warnings": True,
         }
 
-        logger.info("yt-dlp download started for: %s", url)
+        logger.info("Downloading audio | serial=%s | mode=%s", serial_no, mode)
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        files = glob.glob(os.path.join(TMP_DIR, f"{file_id}*.m4a*"))
+        files = glob.glob(os.path.join(TMP_DIR, f"{uid}*.m4a"))
         if not files:
-            raise RuntimeError("Audio file not found after download")
+            raise RuntimeError("Audio file not found")
 
         audio_file = files[0]
-        logger.info("Audio ready: %s", audio_file)
+        duration = get_audio_duration(audio_file)
 
-        # 🔥 SEND AUDIO + NAME BACK TO N8N
-        with open(audio_file, "rb") as f:
-            response = requests.post(
-                N8N_WEBHOOK_URL,
-                files={
-                    "file": (f"{name}.m4a", f, "audio/m4a")
-                },
-                data={
-                    "name": name,
+        # 🔥 SPLIT LOGIC (CORE REQUIREMENT)
+        if duration <= ONE_HOUR_SECONDS:
+            chunk_files = [audio_file]
+            total_parts = 1
+        else:
+            total_parts = math.ceil(duration / CHUNK_SECONDS)
+            chunk_files = split_audio(audio_file, uid, total_parts)
+
+        logger.info(
+            "Prepared %s part(s) | serial=%s | duration=%ss",
+            total_parts, serial_no, duration
+        )
+
+        # 🚀 SEND EACH PART AS SEPARATE WEBHOOK CALL
+        with ThreadPoolExecutor(max_workers=total_parts) as executor:
+            for idx, chunk in enumerate(chunk_files, start=1):
+                payload = {
+                    "serial_no": serial_no,
+                    "name": f"{name} Part {idx}" if total_parts > 1 else name,
+                    "part_no": idx,
+                    "total_parts": total_parts,
+                    "remark": f"Part {idx} of {total_parts}",
+                    "mode": mode,
                     "source": "yt-dlp",
                     "original_url": url
-                },
-                timeout=300
-            )
+                }
 
-        response.raise_for_status()
-        logger.info("Audio + name successfully sent to n8n")
+                executor.submit(
+                    send_to_webhook,
+                    chunk,
+                    payload,
+                    webhook_url
+                )
 
-    except Exception as e:
-        logger.exception("Background processing failed")
-
-        # Notify n8n about error (optional)
-        try:
-            requests.post(
-                N8N_WEBHOOK_URL,
-                json={
-                    "status": "error",
-                    "error": str(e),
-                    "url": url,
-                    "name": name
-                },
-                timeout=30
-            )
-        except Exception:
-            pass
+    except Exception:
+        logger.exception("Processing failed | serial=%s", serial_no)
 
     finally:
-        # Cleanup
-        if audio_file and os.path.exists(audio_file):
+        # Cleanup temp files
+        for f in glob.glob(os.path.join(TMP_DIR, f"{uid}*")):
             try:
-                os.remove(audio_file)
-                logger.info("Cleaned up local audio file")
+                os.remove(f)
             except Exception:
                 pass
