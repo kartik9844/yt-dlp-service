@@ -39,12 +39,7 @@ def health():
 
 # -------- SHARED REQUEST HANDLER -------- #
 
-def handle_download_request(
-    data: dict,
-    background_tasks: BackgroundTasks,
-    webhook_url: str,
-    mode: str
-):
+def handle_download_request(data, background_tasks, webhook_url, mode):
     url = data.get("url")
     name = data.get("name")
     serial_no = data.get("serial_no")
@@ -77,17 +72,11 @@ def handle_download_request(
 # -------- ENDPOINTS -------- #
 
 @app.post("/download")
-def download_production(
-    data: dict = Body(...),
-    background_tasks: BackgroundTasks = None
-):
+def download_production(data: dict = Body(...), background_tasks: BackgroundTasks = None):
     return handle_download_request(data, background_tasks, N8N_WEBHOOK_PROD, "production")
 
 @app.post("/download-test")
-def download_test(
-    data: dict = Body(...),
-    background_tasks: BackgroundTasks = None
-):
+def download_test(data: dict = Body(...), background_tasks: BackgroundTasks = None):
     return handle_download_request(data, background_tasks, N8N_WEBHOOK_TEST, "test")
 
 # ---------------- UTILITIES ---------------- #
@@ -138,9 +127,7 @@ def send_to_webhook(file_path: str, payload: dict, webhook_url: str):
         with open(file_path, "rb") as f:
             response = requests.post(
                 webhook_url,
-                files={
-                    "file": (os.path.basename(file_path), f, "audio/m4a")
-                },
+                files={"file": (os.path.basename(file_path), f, "audio/m4a")},
                 data=payload,
                 timeout=600
             )
@@ -162,33 +149,30 @@ def send_to_webhook(file_path: str, payload: dict, webhook_url: str):
             )
 
     except Exception as e:
-        logger.exception(
-            "🔥 Webhook exception | file=%s | error=%s",
-            os.path.basename(file_path),
-            str(e)
-        )
-
+        logger.exception("🔥 Webhook exception | file=%s | error=%s",
+                         os.path.basename(file_path), str(e))
 
 # ---------------- BACKGROUND JOB ---------------- #
 
-def process_and_send_audio(
-    url: str,
-    name: str,
-    serial_no: str,
-    webhook_url: str,
-    mode: str
-):
+def process_and_send_audio(url, name, serial_no, webhook_url, mode):
     uid = str(uuid.uuid4())
 
     try:
         out_template = os.path.join(TMP_DIR, f"{uid}.%(ext)s")
 
-        # 🔥 FIX 1: Download m4a directly (NO yt-dlp FFmpegExtractAudio)
+        # ✅ FINAL yt-dlp CONFIG (DO NOT FORCE m4a)
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio",
+            "format": "bestaudio/best",
             "outtmpl": out_template,
             "cookiefile": COOKIES_PATH,
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                    "preferredquality": "128",
+                }
+            ],
             "quiet": True,
             "no_warnings": True,
         }
@@ -204,11 +188,9 @@ def process_and_send_audio(
 
         audio_file = files[0]
 
-        logger.info("Download completed, probing duration...")
         duration = get_audio_duration(audio_file)
         logger.info("Duration: %s seconds", duration)
 
-        # 🔥 CORE SPLIT LOGIC
         if duration <= ONE_HOUR_SECONDS:
             chunk_files = [audio_file]
             total_parts = 1
@@ -218,7 +200,6 @@ def process_and_send_audio(
 
         logger.info("Prepared %s part(s)", total_parts)
 
-        # 🚀 SEND EACH PART AS SEPARATE WEBHOOK
         with ThreadPoolExecutor(max_workers=total_parts) as executor:
             for idx, chunk in enumerate(chunk_files, start=1):
                 payload = {
@@ -238,7 +219,6 @@ def process_and_send_audio(
         logger.exception("Processing failed | serial=%s", serial_no)
 
     finally:
-        # Cleanup
         for f in glob.glob(os.path.join(TMP_DIR, f"{uid}*")):
             try:
                 os.remove(f)
