@@ -164,20 +164,25 @@ def process_and_send_audio(url, name, serial_no, webhook_url, mode):
 
         # ✅ MOST STABLE yt-dlp CONFIG (VIDEO → AUDIO)
         ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
-            "outtmpl": out_template,
-            "cookiefile": COOKIES_PATH,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "m4a",
-                    "preferredquality": "128",
-                }
-            ],
-            "quiet": True,
-            "no_warnings": True,
+    # ✅ MOST TOLERANT FORMAT (works for ALL video types)
+    "format": "best/bestvideo*+bestaudio/best",
+
+    "outtmpl": out_template,
+    "cookiefile": COOKIES_PATH,
+
+    # ✅ Let yt-dlp decide merge container
+    # (DO NOT force mp4)
+    "postprocessors": [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+            "preferredquality": "128",
         }
+    ],
+
+    "quiet": True,
+    "no_warnings": True,
+}
 
         logger.info("Downloading video | serial=%s | mode=%s", serial_no, mode)
 
